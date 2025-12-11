@@ -14,7 +14,7 @@ import streamlit as st
 CWA_API_URL = "https://opendata.cwa.gov.tw/fileapi/v1/opendataapi/F-A0010-001"
 
 # ★老師示範金鑰（你也可以改成自己的）
-CWA_API_KEY = "CWA-1FFDDAEC-161F-46A3-BE71-93C32C52829F"
+CWA_API_KEY = "CWA-2E3CED11-CE2F-419C-ABED-3EF61140BA06"
 
 # SQLite 資料庫檔名
 DB_PATH = Path("data.db")
