@@ -1,261 +1,171 @@
-# app.py
 import requests
-import sqlite3
-from pathlib import Path
-
 import pandas as pd
 import streamlit as st
+import sqlite3
+from pathlib import Path
 import urllib3
 
-# 關閉因為 verify=False 產生的 InsecureRequestWarning
+# 關閉 SSL 驗證警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # -----------------------------
 # 設定區
 # -----------------------------
 
-# 中央氣象局 F-A0010-001 檔案 API
-CWA_API_URL = "https://opendata.cwa.gov.tw/fileapi/v1/opendataapi/F-A0010-001"
-
-# ★老師示範金鑰（你也可以改成自己的）
+# API URL 設定為「局屬氣象站-氣象觀測資料」
+CWA_API_URL = "https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0003-001"
 CWA_API_KEY = "CWA-2E3CED11-CE2F-419C-ABED-3EF61140BA06"
-
-# SQLite 資料庫檔名
 DB_PATH = Path("data.db")
 
-
 # -----------------------------
-# 第 1 步：下載中央氣象局 JSON
+# 資料獲取與解析
 # -----------------------------
-def download_weather_json() -> dict:
-    params = {
-        "Authorization": CWA_API_KEY,
-        "downloadType": "WEB",
-        "format": "JSON",
-    }
-    # ★ 方案 A：關閉 SSL 驗證（verify=False）
+def download_observation_json() -> dict:
+    params = {"Authorization": CWA_API_KEY, "format": "JSON"}
     resp = requests.get(CWA_API_URL, params=params, timeout=15, verify=False)
     resp.raise_for_status()
     return resp.json()
 
-
-# -----------------------------
-# 第 2 步：解析 JSON → Python list
-# 每筆資料格式：
-# {
-#   "location": "臺北市",
-#   "min_temp": 23.0,
-#   "max_temp": 30.0,
-#   "description": "多雲短暫陣雨"
-# }
-# -----------------------------
-
-def _get_root_locations(data: dict):
-    """
-    同時處理兩種常見結構：
-    1) fileapi 版本: data["cwaopendata"]["dataset"]["location"]
-    2) rest api 版本: data["records"]["location"]
-    作為保險，避免老師 JSON 結構略有差異。
-    """
-    if "cwaopendata" in data:
-        dataset = data["cwaopendata"].get("dataset", {})
-        return dataset.get("location", [])
-    if "records" in data:
-        return data["records"].get("location", [])
-    return []
+def get_locations_from_records(data: dict):
+    """從 records 中安全地取出 Station 列表"""
+    return data.get("records", {}).get("Station", [])
 
 
-def _get_first_time_value(time_list):
-    """
-    從 time 陣列裡面，拿第一筆的數值。
-    可能有兩種形式：
-      - time[i]["parameter"]["parameterName"]
-      - time[i]["elementValue"][0]["value"] 或 elementValue["value"]
-    """
-    if not time_list:
-        return None
-
-    t0 = time_list[0]
-
-    # 形式 1：parameter
-    if isinstance(t0.get("parameter"), dict):
-        return t0["parameter"].get("parameterName")
-
-    # 形式 2：elementValue（可能是 list 或 dict）
-    ev = t0.get("elementValue")
-    if isinstance(ev, list) and ev:
-        return ev[0].get("value")
-    if isinstance(ev, dict):
-        return ev.get("value")
-
-    return None
-
-
-def parse_weather_json(data: dict):
-    locations = _get_root_locations(data)
+def parse_observation_json(data: dict):
+    """解析觀測資料，取出站名、站ID、溫度和觀測時間"""
+    locations = get_locations_from_records(data)
     result_rows = []
 
     for loc in locations:
-        name = loc.get("locationName", "未知地點")
-        weather_elements = loc.get("weatherElement", [])
+        temp_value = loc.get("WeatherElement", {}).get("AirTemperature")
+
+        if temp_value is None or temp_value in ("-99", "-999"):
+            continue
 
         row = {
-            "location": name,
-            "min_temp": None,
-            "max_temp": None,
-            "description": None,
+            "station_id": loc.get("StationId"),
+            "location_name": loc.get("StationName"),
+            "temperature": None,
+            "obs_time": loc.get("ObsTime", {}).get("DateTime"),
         }
 
-        for elem in weather_elements:
-            elem_name = elem.get("elementName")
-            val = _get_first_time_value(elem.get("time", []))
-            if val is None:
-                continue
-
-            if elem_name == "MinT":
-                # 攝氏溫度，轉 float (失敗就先當作字串)
-                try:
-                    row["min_temp"] = float(val)
-                except ValueError:
-                    row["min_temp"] = val
-            elif elem_name == "MaxT":
-                try:
-                    row["max_temp"] = float(val)
-                except ValueError:
-                    row["max_temp"] = val
-            elif elem_name in ("Wx", "WeatherDescription"):
-                row["description"] = val
-
+        try:
+            row["temperature"] = float(temp_value)
+        except (ValueError, TypeError):
+            row["temperature"] = temp_value
+        
         result_rows.append(row)
 
     return result_rows
 
-
 # -----------------------------
-# 第 3 步：建立 SQLite 資料庫 / 資料表
+# 資料庫操作
 # -----------------------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS weather (
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS weather_observations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            location TEXT,
-            min_temp REAL,
-            max_temp REAL,
-            description TEXT
+            station_id TEXT,
+            location_name TEXT,
+            temperature REAL,
+            obs_time TEXT
         );
-        """
-    )
-
+    """)
     conn.commit()
     conn.close()
 
-
-# -----------------------------
-# 第 4 步：把資料寫進 SQLite
-# -----------------------------
 def save_weather_to_db(rows):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
+    try:
+        st.write(f"💾 save_weather_to_db: 收到 {len(rows)} 筆資料。")
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        
+        cur.execute("DELETE FROM weather_observations;")
+        st.write(f"  - 清空舊資料，影響 {cur.rowcount} 行。")
+        
+        for i, row in enumerate(rows):
+            cur.execute(
+                """
+                INSERT INTO weather_observations (station_id, location_name, temperature, obs_time)
+                VALUES (?, ?, ?, ?);
+                """,
+                (
+                    row.get("station_id"),
+                    row.get("location_name"),
+                    row.get("temperature"),
+                    row.get("obs_time"),
+                ),
+            )
+            # Log every 20 inserts to avoid flooding the UI
+            if (i + 1) % 20 == 0:
+                st.write(f"  - 已插入 {i + 1} 筆...")
 
-    # 先清空舊資料，保持資料庫內容是「本次最新下載」
-    cur.execute("DELETE FROM weather;")
+        conn.commit()
+        st.write("✅ 資料庫 commit 成功。")
+    except sqlite3.Error as e:
+        st.error(f"資料庫錯誤: {e}")
+    finally:
+        if 'conn' in locals() and conn:
+            conn.close()
 
-    for row in rows:
-        cur.execute(
-            """
-            INSERT INTO weather (location, min_temp, max_temp, description)
-            VALUES (?, ?, ?, ?);
-            """,
-            (
-                row.get("location"),
-                row.get("min_temp"),
-                row.get("max_temp"),
-                row.get("description"),
-            ),
-        )
-
-    conn.commit()
-    conn.close()
-
-
-# -----------------------------
-# 第 5 步：從 SQLite 把資料讀出來（給 Streamlit 使用）
-# -----------------------------
 def load_weather_from_db() -> pd.DataFrame:
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query(
-        "SELECT id, location, min_temp, max_temp, description FROM weather;",
+        "SELECT id, station_id, location_name, temperature, obs_time FROM weather_observations;",
         conn,
     )
     conn.close()
     return df
 
-
 # -----------------------------
 # Streamlit 主程式
 # -----------------------------
 def main():
-    st.set_page_config(page_title="CWA 天氣資料（SQLite + Streamlit）", layout="wide")
+    st.set_page_config(page_title="CWA 即時溫度觀測", layout="wide")
+    st.title("中央氣象署 - 即時溫度觀測資料")
+    st.caption("資料來源：局屬氣象站-氣象觀測資料 (O-A0003-001)")
 
-    st.title("中央氣象局 F-A0010-001 天氣資料 Demo")
-    st.caption("Lecture 13 — 資料爬蟲 + SQLite + Streamlit（Part 1）")
-
-    # 左右欄位：左邊控制下載 / 更新，右邊顯示資料表
     col_left, col_right = st.columns([1, 3])
 
     with col_left:
         st.subheader("資料更新")
-
-        if st.button("下載最新 JSON 並寫入 SQLite"):
+        if st.button("下載最新觀測資料並寫入資料庫"):
             try:
-                st.write("⏬ 正在下載中央氣象局 JSON ...")
-                data = download_weather_json()
-
+                st.write("⏬ 正在下載中央氣象署 JSON ...")
+                data = download_observation_json()
                 st.write("🧩 正在解析 JSON ...")
-                rows = parse_weather_json(data)
+                rows = parse_observation_json(data)
+                
+                if rows:
+                    st.write("💾 正在寫入 SQLite 資料庫...")
+                    init_db()
+                    save_weather_to_db(rows)
+                    st.success(f"完成！共寫入 {len(rows)} 筆測站資料。")
+                else:
+                    st.warning("解析完成，但沒有收到任何有效的測站資料。")
+                    st.subheader("API 原始回傳資料")
+                    st.json(data)
 
-                st.write("💾 正在寫入 SQLite（data.db）...")
-                init_db()
-                save_weather_to_db(rows)
-
-                st.success(f"完成！共寫入 {len(rows)} 筆資料。")
             except Exception as e:
                 st.error(f"發生錯誤：{e}")
 
-        st.markdown("---")
-        st.markdown("📌 **說明**")
-        st.markdown(
-            """
-            - 使用資料集：`F-A0010-001`（中央氣象局 Open Data）
-            - 先下載 JSON → 解析出各地區的 MinT / MaxT / Wx
-            - 資料存進 `data.db` 的 `weather` 資料表
-            - 右邊表格是「從 SQLite 讀出來」的結果
-            """
-        )
-
     with col_right:
-        st.subheader("SQLite 中的天氣資料表")
-
+        st.subheader("資料庫中的天氣觀測資料")
         if not DB_PATH.exists():
-            st.info("目前還沒有找到 `data.db`，請先在左邊按下「下載最新 JSON 並寫入 SQLite」。")
+            st.info("資料庫檔案不存在，請先點擊左側按鈕下載資料。")
         else:
             df = load_weather_from_db()
-
             if df.empty:
-                st.warning("資料表目前是空的，請先按左邊的更新按鈕。")
+                st.warning("資料庫目前是空的，請先按左側按鈕更新。")
             else:
                 st.dataframe(df, use_container_width=True)
-                st.caption("↑ 從 SQLite `data.db` 讀出的 `weather` 資料表")
-
+                st.caption("↑ 從 SQLite data.db 讀出的 weather_observations 資料表")
+    
     st.markdown("---")
     st.caption("請記得截圖：畫面要包含 Streamlit 介面 + 天氣資料表。")
 
-
 if __name__ == "__main__":
-    # 確保第一次執行就有資料庫結構
-    init_db()
+    init_db() # 確保程式啟動時資料庫表格已建立
     main()
