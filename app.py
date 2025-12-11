@@ -5,6 +5,10 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import urllib3
+
+# 關閉因為 verify=False 產生的 InsecureRequestWarning
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # -----------------------------
 # 設定區
@@ -29,7 +33,8 @@ def download_weather_json() -> dict:
         "downloadType": "WEB",
         "format": "JSON",
     }
-    resp = requests.get(CWA_API_URL, params=params, timeout=15)
+    # ★ 方案 A：關閉 SSL 驗證（verify=False）
+    resp = requests.get(CWA_API_URL, params=params, timeout=15, verify=False)
     resp.raise_for_status()
     return resp.json()
 
